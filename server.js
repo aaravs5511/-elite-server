@@ -22,8 +22,6 @@ db.exec(`
     password_hash TEXT NOT NULL,
     role TEXT NOT NULL DEFAULT 'receiver',
     ip TEXT,
-    security_question TEXT,
-    security_answer_hash TEXT,
     created_at TEXT DEFAULT (datetime('now'))
   );
   CREATE TABLE IF NOT EXISTS tokens (
@@ -56,15 +54,11 @@ db.exec(`
   );
 `);
 
-// Add columns if upgrading from older DB
-try { db.exec('ALTER TABLE users ADD COLUMN security_question TEXT'); } catch(e) {}
-try { db.exec('ALTER TABLE users ADD COLUMN security_answer_hash TEXT'); } catch(e) {}
-
 const q = {
   userByName: db.prepare('SELECT * FROM users WHERE username = ? COLLATE NOCASE'),
   userById: db.prepare('SELECT * FROM users WHERE id = ?'),
   userByIp: db.prepare('SELECT * FROM users WHERE ip = ? AND role = ?'),
-  createUser: db.prepare('INSERT INTO users (id, username, password_hash, role, ip, security_question, security_answer_hash) VALUES (?, ?, ?, ?, ?, ?, ?)'),
+  createUser: db.prepare('INSERT INTO users (id, username, password_hash, role, ip) VALUES (?, ?, ?, ?, ?)'),
   updatePassword: db.prepare('UPDATE users SET password_hash = ? WHERE id = ?'),
   createToken: db.prepare('INSERT INTO tokens (token, user_id, expires_at) VALUES (?, ?, ?)'),
   getToken: db.prepare("SELECT * FROM tokens WHERE token = ? AND expires_at > datetime('now')"),
@@ -89,7 +83,7 @@ const q = {
   getHistory: db.prepare('SELECT action, domain, detail, created_at FROM history WHERE user_id = ? ORDER BY created_at DESC LIMIT 100'),
 };
 
-// Expiry checker
+// ==================== EXPIRY CHECKER (every 30s) ====================
 setInterval(() => {
   const expired = q.getExpiredActive.all();
   expired.forEach(s => {
@@ -101,9 +95,9 @@ setInterval(() => {
 
 setInterval(() => { q.cleanTokens.run(); }, 3600000);
 
-// Helpers
+// ==================== HELPERS ====================
 function hash(pw) { const s = crypto.randomBytes(16).toString('hex'); return s + ':' + crypto.scryptSync(pw, s, 64).toString('hex'); }
-function verify(pw, stored) { if (!stored) return false; const [s, h] = stored.split(':'); return h === crypto.scryptSync(pw, s, 64).toString('hex'); }
+function verify(pw, stored) { const [s, h] = stored.split(':'); return h === crypto.scryptSync(pw, s, 64).toString('hex'); }
 function makeToken(uid) { const t = crypto.randomBytes(48).toString('hex'); q.createToken.run(t, uid, new Date(Date.now() + 90 * 86400000).toISOString()); return t; }
 function getIP(req) { return req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.socket.remoteAddress || 'unknown'; }
 
@@ -128,11 +122,11 @@ function calcExpiry(label, customDate) {
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 
-app.get('/', (req, res) => res.json({ name: 'Elite Access Server', version: '5.1', online: clients.size }));
+app.get('/', (req, res) => res.json({ name: 'Elite Access Server', version: '5.0', online: clients.size }));
 
-// Register (both roles need password, receivers also get security question)
+// ==================== REGISTER (both roles need password, IP check for receivers) ====================
 app.post('/api/register', (req, res) => {
-  const { username, password, role, securityQuestion, securityAnswer } = req.body;
+  const { username, password, role } = req.body;
   if (!username) return res.status(400).json({ error: 'Username required' });
   if (!/^[a-zA-Z0-9_.]{3,20}$/.test(username)) return res.status(400).json({ error: 'Username: 3-20 characters (letters, numbers, . and _ only)' });
   if (!password || password.length < 4) return res.status(400).json({ error: 'Password required (minimum 4 characters)' });
@@ -141,7 +135,7 @@ app.post('/api/register', (req, res) => {
   const userRole = role === 'owner' ? 'owner' : 'receiver';
   const ip = getIP(req);
 
-  // IP check for receivers
+  // IP CHECK: One IP = one receiver account
   if (userRole === 'receiver') {
     const existing = q.userByIp.get(ip, 'receiver');
     if (existing) {
@@ -151,20 +145,15 @@ app.post('/api/register', (req, res) => {
         existingUsername: existing.username
       });
     }
-    // Receivers must have a security question
-    if (!securityQuestion || !securityAnswer) {
-      return res.status(400).json({ error: 'Security question and answer are required' });
-    }
   }
 
   const id = uuidv4();
-  const sqHash = securityAnswer ? hash(securityAnswer.toLowerCase().trim()) : null;
-  q.createUser.run(id, username, hash(password), userRole, ip, securityQuestion || null, sqHash);
+  q.createUser.run(id, username, hash(password), userRole, ip);
   q.addHistory.run(id, 'registered', null, userRole + ' account created');
   res.status(201).json({ id, username, role: userRole, token: makeToken(id) });
 });
 
-// Login
+// ==================== LOGIN (both roles need password) ====================
 app.post('/api/login', (req, res) => {
   const { username, password } = req.body;
   if (!username || !password) return res.status(400).json({ error: 'Username and password required' });
@@ -176,43 +165,6 @@ app.post('/api/login', (req, res) => {
   res.json({ id: user.id, username: user.username, role: user.role, token: makeToken(user.id) });
 });
 
-// ==================== SELF-RECOVERY (security question) ====================
-// Step 1: Get the security question for a username
-app.post('/api/recover/question', (req, res) => {
-  const { username } = req.body;
-  if (!username) return res.status(400).json({ error: 'Enter your username' });
-  const user = q.userByName.get(username);
-  if (!user) return res.status(404).json({ error: 'Username not found. Check the spelling or contact the account owner.' });
-  if (!user.security_question) return res.status(400).json({ error: 'No security question set. Contact the account owner to reset your password.' });
-
-  res.json({ question: user.security_question });
-});
-
-// Step 2: Verify answer and set new password
-app.post('/api/recover/verify', (req, res) => {
-  const { username, answer, newPassword } = req.body;
-  if (!username || !answer || !newPassword) return res.status(400).json({ error: 'All fields required' });
-  if (newPassword.length < 4) return res.status(400).json({ error: 'New password must be at least 4 characters' });
-
-  const user = q.userByName.get(username);
-  if (!user) return res.status(404).json({ error: 'User not found' });
-  if (!user.security_answer_hash) return res.status(400).json({ error: 'No security question set. Contact the account owner.' });
-
-  // Verify the answer (case-insensitive, trimmed)
-  if (!verify(answer.toLowerCase().trim(), user.security_answer_hash)) {
-    q.addHistory.run(user.id, 'recovery_failed', null, 'Wrong security answer');
-    return res.status(401).json({ error: 'Wrong answer. Try again or contact the account owner.' });
-  }
-
-  // Answer correct — reset password
-  q.updatePassword.run(hash(newPassword), user.id);
-  q.deleteUserTokens.run(user.id); // Force re-login everywhere
-  q.addHistory.run(user.id, 'password_recovered', null, 'Password reset via security question');
-
-  res.json({ success: true, message: 'Password reset successfully! You can now login with your new password.' });
-});
-
-// ==================== STANDARD ROUTES ====================
 app.get('/api/me', auth, (req, res) => res.json({ id: req.user.id, username: req.user.username, role: req.user.role }));
 
 app.get('/api/user/:username', auth, (req, res) => {
@@ -221,53 +173,67 @@ app.get('/api/user/:username', auth, (req, res) => {
   res.json({ id: u.id, username: u.username, role: u.role, online: clients.has(u.id) });
 });
 
-// Owner reset receiver password
+// ==================== PASSWORD RESET (owner can reset any receiver's password) ====================
 app.post('/api/reset-password', auth, (req, res) => {
   if (req.user.role !== 'owner') return res.status(403).json({ error: 'Only owner can reset passwords' });
   const { username, newPassword } = req.body;
-  if (!username || !newPassword || newPassword.length < 4) return res.status(400).json({ error: 'Username and new password (min 4) required' });
+  if (!username || !newPassword || newPassword.length < 4) return res.status(400).json({ error: 'Username and new password (min 4 chars) required' });
+
   const target = q.userByName.get(username);
   if (!target) return res.status(404).json({ error: 'User not found' });
+
   q.updatePassword.run(hash(newPassword), target.id);
-  q.deleteUserTokens.run(target.id);
+  q.deleteUserTokens.run(target.id); // Force re-login
   q.addHistory.run(target.id, 'password_reset', null, 'Password reset by owner');
   q.addHistory.run(req.user.id, 'reset_password', null, 'Reset password for ' + username);
-  res.json({ success: true, message: 'Password reset for ' + username });
+
+  res.json({ success: true, message: 'Password reset for ' + username + '. They need to login again.' });
 });
 
+// Owner can change their own password
 app.post('/api/change-password', auth, (req, res) => {
   const { currentPassword, newPassword } = req.body;
-  if (!currentPassword || !newPassword || newPassword.length < 4) return res.status(400).json({ error: 'Both passwords required' });
+  if (!currentPassword || !newPassword || newPassword.length < 4) return res.status(400).json({ error: 'Current and new password required' });
   if (!verify(currentPassword, req.user.password_hash)) return res.status(401).json({ error: 'Current password is wrong' });
+
   q.updatePassword.run(hash(newPassword), req.user.id);
   q.addHistory.run(req.user.id, 'password_changed', null, 'Password changed');
-  res.json({ success: true });
+  res.json({ success: true, message: 'Password updated' });
 });
 
+// List all receiver accounts (owner only)
 app.get('/api/receivers', auth, (req, res) => {
   if (req.user.role !== 'owner') return res.status(403).json({ error: 'Owner only' });
   res.json({ receivers: q.allReceivers.all() });
 });
 
-// Send (owner only, anti-reshare)
+// ==================== SEND (owner only, anti-reshare) ====================
 app.post('/api/send', auth, (req, res) => {
-  if (req.user.role !== 'owner') return res.status(403).json({ error: 'Only owner accounts can share', code: 'RECEIVER_CANNOT_SEND' });
+  if (req.user.role !== 'owner') return res.status(403).json({ error: 'Only owner accounts can share sessions', code: 'RECEIVER_CANNOT_SEND' });
+
   const { toUsername, domain, sessionData, duration, customDate } = req.body;
   if (!toUsername || !domain || !sessionData) return res.status(400).json({ error: 'Missing fields' });
+
   const to = q.userByName.get(toUsername);
   if (!to) return res.status(404).json({ error: 'User not found' });
   if (to.id === req.user.id) return res.status(400).json({ error: 'Cannot send to yourself' });
+
   const received = q.checkReceivedDomain.get(req.user.id, domain);
   if (received) return res.status(403).json({ error: 'Reshare not allowed', code: 'RESHARE_BLOCKED' });
 
   const id = uuidv4();
   const expiresAt = calcExpiry(duration || 'unlimited', customDate);
+
   q.createSession.run(id, req.user.id, req.user.username, to.id, to.username, domain, JSON.stringify(sessionData), duration || 'unlimited', expiresAt);
   q.addHistory.run(req.user.id, 'sent', domain, 'Sent to ' + to.username + ' (' + (duration || 'unlimited') + ')');
   q.addHistory.run(to.id, 'received', domain, 'From ' + req.user.username + ' (' + (duration || 'unlimited') + ')');
 
-  const delivered = sendWS(to.id, { type: 'session-received', sessionId: id, from: req.user.username, domain, durationLabel: duration || 'unlimited', expiresAt, sessionData, timestamp: new Date().toISOString() });
+  const delivered = sendWS(to.id, {
+    type: 'session-received', sessionId: id, from: req.user.username, domain,
+    durationLabel: duration || 'unlimited', expiresAt, sessionData, timestamp: new Date().toISOString()
+  });
   if (delivered) q.markDelivered.run(id);
+
   res.json({ id, delivered, message: delivered ? 'Delivered instantly!' : 'User offline — will receive later.' });
 });
 
@@ -293,9 +259,11 @@ app.post('/api/revoke/:id', auth, (req, res) => {
   const s = q.getSession.get(req.params.id);
   if (!s) return res.status(404).json({ error: 'Not found' });
   if (s.from_user_id !== req.user.id) return res.status(403).json({ error: 'Only sender can revoke' });
+
   q.revokeSession.run(req.params.id, req.user.id);
   q.addHistory.run(req.user.id, 'revoked', s.domain, 'Revoked from ' + s.to_username);
   q.addHistory.run(s.to_user_id, 'access_revoked', s.domain, 'Revoked by ' + req.user.username);
+
   sendWS(s.to_user_id, { type: 'force-logout', sessionId: req.params.id, domain: s.domain, reason: 'Access revoked by ' + req.user.username });
   res.json({ success: true });
 });
@@ -304,7 +272,7 @@ app.get('/api/history', auth, (req, res) => res.json({ history: q.getHistory.all
 
 app.post('/api/tamper', auth, (req, res) => {
   const { reason, extensionName } = req.body;
-  q.addHistory.run(req.user.id, 'tamper_detected', null, (extensionName || '') + ' — ' + (reason || 'Tamper'));
+  q.addHistory.run(req.user.id, 'tamper_detected', null, (extensionName || '') + ' — ' + (reason || 'Tamper detected'));
   const active = q.getActiveForUser.all(req.user.id);
   active.forEach(s => sendWS(req.user.id, { type: 'force-logout', sessionId: s.id, domain: s.domain, reason: 'Security violation' }));
   q.deleteUserTokens.run(req.user.id);
@@ -351,4 +319,4 @@ wss.on('connection', (ws) => {
 setInterval(() => { wss.clients.forEach(ws => { if (!ws.isAlive) return ws.terminate(); ws.isAlive = false; ws.ping(); }); }, 30000);
 function sendWS(uid, data) { const ws = clients.get(uid); if (ws?.readyState === 1) { ws.send(JSON.stringify(data)); return true; } return false; }
 
-server.listen(PORT, () => console.log('Elite Access Server v5.1 on port ' + PORT));
+server.listen(PORT, () => console.log('Elite Access Server v5 on port ' + PORT));
