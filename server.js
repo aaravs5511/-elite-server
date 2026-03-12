@@ -12,7 +12,6 @@ const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
 const PORT = process.env.PORT || 3000;
 
-// ==================== DATABASE ====================
 const dbPath = process.env.DB_PATH || path.join(__dirname, 'data.db');
 const db = new Database(dbPath);
 db.pragma('journal_mode = WAL');
@@ -21,7 +20,8 @@ db.exec(`
   CREATE TABLE IF NOT EXISTS users (
     id TEXT PRIMARY KEY,
     username TEXT UNIQUE NOT NULL COLLATE NOCASE,
-    password_hash TEXT NOT NULL,
+    password_hash TEXT,
+    role TEXT NOT NULL DEFAULT 'receiver',
     created_at TEXT DEFAULT (datetime('now'))
   );
   CREATE TABLE IF NOT EXISTS tokens (
@@ -44,32 +44,69 @@ db.exec(`
     applied INTEGER DEFAULT 0,
     created_at TEXT DEFAULT (datetime('now'))
   );
+  CREATE TABLE IF NOT EXISTS history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id TEXT NOT NULL,
+    action TEXT NOT NULL,
+    domain TEXT,
+    detail TEXT,
+    created_at TEXT DEFAULT (datetime('now'))
+  );
+  CREATE TABLE IF NOT EXISTS heartbeats (
+    user_id TEXT PRIMARY KEY,
+    last_beat TEXT DEFAULT (datetime('now'))
+  );
 `);
 
 const q = {
   userByName: db.prepare('SELECT * FROM users WHERE username = ? COLLATE NOCASE'),
   userById: db.prepare('SELECT * FROM users WHERE id = ?'),
-  createUser: db.prepare('INSERT INTO users (id, username, password_hash) VALUES (?, ?, ?)'),
+  createUser: db.prepare('INSERT INTO users (id, username, password_hash, role) VALUES (?, ?, ?, ?)'),
   createToken: db.prepare('INSERT INTO tokens (token, user_id, expires_at) VALUES (?, ?, ?)'),
   getToken: db.prepare("SELECT * FROM tokens WHERE token = ? AND expires_at > datetime('now')"),
   deleteToken: db.prepare('DELETE FROM tokens WHERE token = ?'),
+  deleteUserTokens: db.prepare('DELETE FROM tokens WHERE user_id = ?'),
   cleanTokens: db.prepare("DELETE FROM tokens WHERE expires_at < datetime('now')"),
 
   createSession: db.prepare('INSERT INTO sessions (id, from_user_id, from_username, to_user_id, to_username, domain, session_data, duration_label, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'),
-
   getInbox: db.prepare("SELECT id, from_username, domain, duration_label, expires_at, revoked, applied, created_at FROM sessions WHERE to_user_id = ? AND revoked = 0 AND (expires_at IS NULL OR expires_at > datetime('now')) ORDER BY created_at DESC"),
   getSent: db.prepare("SELECT id, to_username, domain, duration_label, expires_at, revoked, applied, created_at FROM sessions WHERE from_user_id = ? ORDER BY created_at DESC LIMIT 100"),
   getSession: db.prepare('SELECT * FROM sessions WHERE id = ?'),
   markDelivered: db.prepare('UPDATE sessions SET delivered = 1 WHERE id = ?'),
   markApplied: db.prepare('UPDATE sessions SET applied = 1 WHERE id = ?'),
   revokeSession: db.prepare('UPDATE sessions SET revoked = 1 WHERE id = ? AND from_user_id = ?'),
-  cleanExpired: db.prepare("DELETE FROM sessions WHERE expires_at IS NOT NULL AND expires_at < datetime('now', '-7 days')"),
-
-  // ANTI-RESHARE: Check if user received (not sent) an active session for this domain
   checkReceivedDomain: db.prepare("SELECT id FROM sessions WHERE to_user_id = ? AND domain = ? AND revoked = 0 AND (expires_at IS NULL OR expires_at > datetime('now')) LIMIT 1"),
+  getExpiredSessions: db.prepare("SELECT * FROM sessions WHERE expires_at IS NOT NULL AND expires_at <= datetime('now') AND revoked = 0"),
+  markExpiredRevoked: db.prepare("UPDATE sessions SET revoked = 1 WHERE expires_at IS NOT NULL AND expires_at <= datetime('now') AND revoked = 0"),
+  getActiveSessionsForUser: db.prepare("SELECT * FROM sessions WHERE to_user_id = ? AND revoked = 0 AND applied = 1 AND (expires_at IS NULL OR expires_at > datetime('now'))"),
+  cleanOld: db.prepare("DELETE FROM sessions WHERE created_at < datetime('now', '-90 days')"),
+
+  addHistory: db.prepare('INSERT INTO history (user_id, action, domain, detail) VALUES (?, ?, ?, ?)'),
+  getHistory: db.prepare('SELECT action, domain, detail, created_at FROM history WHERE user_id = ? ORDER BY created_at DESC LIMIT 100'),
+
+  upsertHeartbeat: db.prepare("INSERT INTO heartbeats (user_id, last_beat) VALUES (?, datetime('now')) ON CONFLICT(user_id) DO UPDATE SET last_beat = datetime('now')"),
+  getStaleHeartbeats: db.prepare("SELECT user_id FROM heartbeats WHERE last_beat < datetime('now', '-2 minutes')"),
 };
 
-setInterval(() => { q.cleanTokens.run(); q.cleanExpired.run(); }, 3600000);
+// ==================== EXPIRY CHECKER ====================
+// Runs every 30 seconds — finds expired sessions and sends force-logout
+setInterval(() => {
+  const expired = q.getExpiredSessions.all();
+  expired.forEach(s => {
+    // Send force-logout to the recipient
+    sendWS(s.to_user_id, {
+      type: 'force-logout',
+      sessionId: s.id,
+      domain: s.domain,
+      reason: 'Access expired'
+    });
+    q.addHistory.run(s.to_user_id, 'expired', s.domain, 'Access expired automatically');
+  });
+  q.markExpiredRevoked.run();
+}, 30000);
+
+// Cleanup old data hourly
+setInterval(() => { q.cleanTokens.run(); q.cleanOld.run(); }, 3600000);
 
 // ==================== HELPERS ====================
 function hash(pw) {
@@ -82,21 +119,22 @@ function verify(pw, stored) {
 }
 function makeToken(userId) {
   const t = crypto.randomBytes(48).toString('hex');
-  q.createToken.run(t, userId, new Date(Date.now() + 30 * 86400000).toISOString());
+  q.createToken.run(t, userId, new Date(Date.now() + 90 * 86400000).toISOString());
   return t;
 }
 function auth(req, res, next) {
   const h = req.headers.authorization;
   if (!h?.startsWith('Bearer ')) return res.status(401).json({ error: 'Login required' });
   const row = q.getToken.get(h.split(' ')[1]);
-  if (!row) return res.status(401).json({ error: 'Session expired, please login again' });
+  if (!row) return res.status(401).json({ error: 'Session expired' });
   req.user = q.userById.get(row.user_id);
   if (!req.user) return res.status(401).json({ error: 'User not found' });
   next();
 }
-function calcExpiry(label) {
+function calcExpiry(label, customDate) {
+  if (customDate) return new Date(customDate).toISOString();
   if (!label || label === 'unlimited') return null;
-  const map = { '1h': 3600, '4h': 14400, '12h': 43200, '1d': 86400, '3d': 259200, '7d': 604800, '14d': 1209600, '30d': 2592000 };
+  const map = { '1h': 3600, '4h': 14400, '12h': 43200, '1d': 86400, '3d': 259200, '7d': 604800, '14d': 1209600, '30d': 2592000, '90d': 7776000 };
   const secs = map[label];
   return secs ? new Date(Date.now() + secs * 1000).toISOString() : null;
 }
@@ -106,66 +144,87 @@ app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 
 app.get('/', (req, res) => {
-  res.json({ name: 'Elite Access Server', status: 'running', online: clients.size });
+  res.json({ name: 'Elite Access Server', version: '4.0', status: 'running', online: clients.size });
 });
 
+// Register owner (with password)
 app.post('/api/register', (req, res) => {
-  const { username, password } = req.body;
-  if (!username || !password) return res.status(400).json({ error: 'Username and password required' });
-  if (!/^[a-zA-Z0-9_.]{3,20}$/.test(username)) return res.status(400).json({ error: 'Username: 3-20 characters, letters/numbers/._' });
-  if (password.length < 4) return res.status(400).json({ error: 'Password too short (min 4)' });
+  const { username, password, role } = req.body;
+  if (!username) return res.status(400).json({ error: 'Username required' });
+  if (!/^[a-zA-Z0-9_.]{3,20}$/.test(username)) return res.status(400).json({ error: 'Username: 3-20 chars, letters/numbers/._ only' });
   if (q.userByName.get(username)) return res.status(409).json({ error: 'Username already taken' });
-  const id = uuidv4();
-  q.createUser.run(id, username, hash(password));
-  res.status(201).json({ id, username, token: makeToken(id) });
+
+  const userRole = role === 'owner' ? 'owner' : 'receiver';
+
+  // Owner needs password, receiver doesn't
+  if (userRole === 'owner') {
+    if (!password || password.length < 4) return res.status(400).json({ error: 'Password required (min 4 chars)' });
+    const id = uuidv4();
+    q.createUser.run(id, username, hash(password), 'owner');
+    q.addHistory.run(id, 'registered', null, 'Owner account created');
+    res.status(201).json({ id, username, role: 'owner', token: makeToken(id) });
+  } else {
+    // Receiver — no password
+    const id = uuidv4();
+    q.createUser.run(id, username, null, 'receiver');
+    q.addHistory.run(id, 'registered', null, 'Receiver account created');
+    res.status(201).json({ id, username, role: 'receiver', token: makeToken(id) });
+  }
 });
 
+// Login (owner with password, receiver with just username)
 app.post('/api/login', (req, res) => {
   const { username, password } = req.body;
-  if (!username || !password) return res.status(400).json({ error: 'Username and password required' });
+  if (!username) return res.status(400).json({ error: 'Username required' });
   const user = q.userByName.get(username);
-  if (!user || !verify(password, user.password_hash)) return res.status(401).json({ error: 'Wrong username or password' });
-  res.json({ id: user.id, username: user.username, token: makeToken(user.id) });
+  if (!user) return res.status(401).json({ error: 'User not found' });
+
+  if (user.role === 'owner') {
+    if (!password || !user.password_hash || !verify(password, user.password_hash))
+      return res.status(401).json({ error: 'Wrong password' });
+  }
+  // Receiver logs in with just username (no password)
+
+  q.addHistory.run(user.id, 'login', null, 'Logged in');
+  res.json({ id: user.id, username: user.username, role: user.role, token: makeToken(user.id) });
 });
 
 app.get('/api/me', auth, (req, res) => {
-  res.json({ id: req.user.id, username: req.user.username });
+  res.json({ id: req.user.id, username: req.user.username, role: req.user.role });
 });
 
 app.get('/api/user/:username', auth, (req, res) => {
   const u = q.userByName.get(req.params.username);
   if (!u) return res.status(404).json({ error: 'User not found' });
-  res.json({ id: u.id, username: u.username, online: clients.has(u.id) });
+  res.json({ id: u.id, username: u.username, role: u.role, online: clients.has(u.id) });
 });
 
-// ==================== SEND SESSION (with anti-reshare) ====================
+// ==================== SEND (owner only) ====================
 app.post('/api/send', auth, (req, res) => {
-  const { toUsername, domain, sessionData, duration } = req.body;
+  if (req.user.role !== 'owner') return res.status(403).json({ error: 'Only owner accounts can share sessions', code: 'RECEIVER_CANNOT_SEND' });
+
+  const { toUsername, domain, sessionData, duration, customDate } = req.body;
   if (!toUsername || !domain || !sessionData) return res.status(400).json({ error: 'Missing fields' });
 
   const to = q.userByName.get(toUsername);
   if (!to) return res.status(404).json({ error: 'User not found' });
   if (to.id === req.user.id) return res.status(400).json({ error: 'Cannot send to yourself' });
 
-  // ---- ANTI-RESHARE CHECK ----
-  // If the sender received this domain from someone else, BLOCK the share
-  const receivedSession = q.checkReceivedDomain.get(req.user.id, domain);
-  if (receivedSession) {
-    return res.status(403).json({
-      error: 'Reshare not allowed. You received access to this site from someone else — only the original owner can share it.',
-      code: 'RESHARE_BLOCKED'
-    });
-  }
-  // ---- END ANTI-RESHARE ----
+  // Anti-reshare: check if sender received this domain
+  const received = q.checkReceivedDomain.get(req.user.id, domain);
+  if (received) return res.status(403).json({ error: 'Reshare not allowed', code: 'RESHARE_BLOCKED' });
 
   const id = uuidv4();
-  const expiresAt = calcExpiry(duration || 'unlimited');
+  const expiresAt = calcExpiry(duration || 'unlimited', customDate);
 
   q.createSession.run(id, req.user.id, req.user.username, to.id, to.username, domain, JSON.stringify(sessionData), duration || 'unlimited', expiresAt);
+  q.addHistory.run(req.user.id, 'sent', domain, 'Sent to ' + to.username + ' (' + (duration || 'unlimited') + ')');
+  q.addHistory.run(to.id, 'received', domain, 'From ' + req.user.username + ' (' + (duration || 'unlimited') + ')');
 
   const delivered = sendWS(to.id, {
     type: 'session-received',
-    sessionId: id, from: req.user.username, domain, durationLabel: duration || 'unlimited', expiresAt,
+    sessionId: id, from: req.user.username, domain,
+    durationLabel: duration || 'unlimited', expiresAt,
     sessionData, timestamp: new Date().toISOString()
   });
   if (delivered) q.markDelivered.run(id);
@@ -178,6 +237,7 @@ app.get('/api/inbox', auth, (req, res) => {
 });
 
 app.get('/api/sent', auth, (req, res) => {
+  if (req.user.role !== 'owner') return res.json({ sessions: [] });
   res.json({ sessions: q.getSent.all(req.user.id) });
 });
 
@@ -186,24 +246,59 @@ app.get('/api/session/:id', auth, (req, res) => {
   if (!s) return res.status(404).json({ error: 'Session not found' });
   if (s.to_user_id !== req.user.id) return res.status(403).json({ error: 'Not your session' });
   if (s.revoked) return res.status(410).json({ error: 'Access was revoked by the sender' });
-  if (s.expires_at && new Date(s.expires_at) < new Date()) return res.status(410).json({ error: 'This access has expired' });
+  if (s.expires_at && new Date(s.expires_at) < new Date()) return res.status(410).json({ error: 'Access expired' });
   q.markApplied.run(s.id);
+  q.addHistory.run(req.user.id, 'applied', s.domain, 'Logged into ' + s.domain);
   res.json({ id: s.id, domain: s.domain, sessionData: JSON.parse(s.session_data), from: s.from_username });
 });
 
 app.post('/api/revoke/:id', auth, (req, res) => {
+  if (req.user.role !== 'owner') return res.status(403).json({ error: 'Only owner can revoke' });
   const s = q.getSession.get(req.params.id);
   if (!s) return res.status(404).json({ error: 'Session not found' });
-  if (s.from_user_id !== req.user.id) return res.status(403).json({ error: 'Only the sender can revoke' });
+  if (s.from_user_id !== req.user.id) return res.status(403).json({ error: 'Only sender can revoke' });
+
   q.revokeSession.run(req.params.id, req.user.id);
-  sendWS(s.to_user_id, { type: 'session-revoked', sessionId: req.params.id, domain: s.domain });
+  q.addHistory.run(req.user.id, 'revoked', s.domain, 'Revoked access from ' + s.to_username);
+  q.addHistory.run(s.to_user_id, 'access_revoked', s.domain, 'Access revoked by ' + req.user.username);
+
+  // FORCE LOGOUT — send command to receiver
+  sendWS(s.to_user_id, {
+    type: 'force-logout',
+    sessionId: req.params.id,
+    domain: s.domain,
+    reason: 'Access revoked by ' + req.user.username
+  });
+
   res.json({ success: true });
 });
 
-// Check if user can share a domain (anti-reshare pre-check)
-app.get('/api/canshare/:domain', auth, (req, res) => {
-  const received = q.checkReceivedDomain.get(req.user.id, req.params.domain);
-  res.json({ canShare: !received });
+app.get('/api/history', auth, (req, res) => {
+  res.json({ history: q.getHistory.all(req.user.id) });
+});
+
+// Heartbeat from receiver (anti-tamper check)
+app.post('/api/heartbeat', auth, (req, res) => {
+  q.upsertHeartbeat.run(req.user.id);
+  res.json({ ok: true });
+});
+
+// Report tamper detection
+app.post('/api/tamper', auth, (req, res) => {
+  const { reason } = req.body;
+  q.addHistory.run(req.user.id, 'tamper_detected', null, reason || 'Tamper detected');
+
+  // Force logout all sessions for this user
+  const activeSessions = q.getActiveSessionsForUser.all(req.user.id);
+  activeSessions.forEach(s => {
+    // Clear cookies for all active domains
+    sendWS(req.user.id, { type: 'force-logout', sessionId: s.id, domain: s.domain, reason: 'Security violation detected' });
+  });
+
+  // Delete all tokens (force re-login)
+  q.deleteUserTokens.run(req.user.id);
+
+  res.json({ ok: true });
 });
 
 app.post('/api/logout', auth, (req, res) => {
@@ -229,9 +324,9 @@ wss.on('connection', (ws) => {
         if (!user) { ws.close(); return; }
         userId = user.id;
         clients.set(userId, ws);
-        ws.send(JSON.stringify({ type: 'authenticated', username: user.username }));
+        ws.send(JSON.stringify({ type: 'authenticated', username: user.username, role: user.role }));
 
-        // Deliver pending inbox items
+        // Deliver pending
         const pending = q.getInbox.all(userId);
         pending.forEach(p => {
           const full = q.getSession.get(p.id);
@@ -248,6 +343,9 @@ wss.on('connection', (ws) => {
       else if (msg.type === 'check-online') {
         const u = q.userByName.get(msg.username);
         ws.send(JSON.stringify({ type: 'online-status', username: msg.username, online: u ? clients.has(u.id) : false }));
+      }
+      else if (msg.type === 'heartbeat') {
+        if (userId) q.upsertHeartbeat.run(userId);
       }
       else if (msg.type === 'ping') ws.send('{"type":"pong"}');
     } catch (e) { console.error('WS:', e.message); }
@@ -266,4 +364,4 @@ function sendWS(userId, data) {
   return false;
 }
 
-server.listen(PORT, () => console.log(`Elite server running on port ${PORT}`));
+server.listen(PORT, () => console.log(`Elite Access Server v4 on port ${PORT}`));
