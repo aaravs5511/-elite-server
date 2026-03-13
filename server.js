@@ -2,7 +2,9 @@ const express = require('express');
 const http = require('http');
 const WebSocket = require('ws');
 const crypto = require('crypto');
+const fs = require('fs');
 const path = require('path');
+const initSqlJs = require('sql.js');
 
 const app = express();
 const server = http.createServer(app);
@@ -17,77 +19,154 @@ app.use((req, res, next) => {
   next();
 });
 
-// ==================== DATABASE (SQLite) ====================
-const Database = require('better-sqlite3');
-const DB_PATH = process.env.DB_PATH || path.join(__dirname, 'elite.db');
-const db = new Database(DB_PATH);
-db.pragma('journal_mode = WAL');
-db.pragma('foreign_keys = ON');
+// ==================== DATABASE ====================
+const DB_PATH = path.join(__dirname, 'elite.db');
+let db = null;
 
-db.exec(`
-  CREATE TABLE IF NOT EXISTS users (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    username TEXT UNIQUE NOT NULL,
-    password_hash TEXT NOT NULL,
-    role TEXT NOT NULL DEFAULT 'receiver',
-    ip TEXT,
-    security_question TEXT,
-    security_answer_hash TEXT,
-    uninstall_token TEXT UNIQUE,
-    last_heartbeat TEXT,
-    created_at TEXT DEFAULT (datetime('now'))
-  );
-  CREATE TABLE IF NOT EXISTS sessions (
-    id TEXT PRIMARY KEY,
-    from_user_id INTEGER NOT NULL,
-    to_user_id INTEGER NOT NULL,
-    from_username TEXT NOT NULL,
-    to_username TEXT NOT NULL,
-    domain TEXT NOT NULL,
-    session_data TEXT NOT NULL,
-    duration TEXT,
-    duration_label TEXT,
-    expires_at TEXT,
-    applied INTEGER DEFAULT 0,
-    revoked INTEGER DEFAULT 0,
-    original_sender_id INTEGER,
-    created_at TEXT DEFAULT (datetime('now')),
-    FOREIGN KEY (from_user_id) REFERENCES users(id),
-    FOREIGN KEY (to_user_id) REFERENCES users(id)
-  );
-  CREATE TABLE IF NOT EXISTS history (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER NOT NULL,
-    action TEXT NOT NULL,
-    domain TEXT,
-    detail TEXT,
-    created_at TEXT DEFAULT (datetime('now')),
-    FOREIGN KEY (user_id) REFERENCES users(id)
-  );
-  CREATE TABLE IF NOT EXISTS tokens (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER NOT NULL,
-    token TEXT UNIQUE NOT NULL,
-    created_at TEXT DEFAULT (datetime('now')),
-    FOREIGN KEY (user_id) REFERENCES users(id)
-  );
-  CREATE TABLE IF NOT EXISTS about_info (
-    id INTEGER PRIMARY KEY DEFAULT 1,
-    data TEXT DEFAULT '{}'
-  );
-  INSERT OR IGNORE INTO about_info (id, data) VALUES (1, '{}');
-`);
+function saveDB() {
+  try {
+    const data = db.export();
+    const buffer = Buffer.from(data);
+    fs.writeFileSync(DB_PATH, buffer);
+  } catch (e) { console.error('DB save error:', e.message); }
+}
+
+// Auto-save every 30 seconds
+setInterval(saveDB, 30000);
+
+async function initDB() {
+  const SQL = await initSqlJs();
+  try {
+    if (fs.existsSync(DB_PATH)) {
+      const fileBuffer = fs.readFileSync(DB_PATH);
+      db = new SQL.Database(fileBuffer);
+      console.log('Loaded existing database');
+    } else {
+      db = new SQL.Database();
+      console.log('Created new database');
+    }
+  } catch (e) {
+    console.log('Creating fresh database:', e.message);
+    db = new SQL.Database();
+  }
+
+  db.run(`
+    CREATE TABLE IF NOT EXISTS users (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      username TEXT UNIQUE NOT NULL,
+      password_hash TEXT NOT NULL,
+      role TEXT NOT NULL DEFAULT 'receiver',
+      ip TEXT,
+      security_question TEXT,
+      security_answer_hash TEXT,
+      uninstall_token TEXT UNIQUE,
+      last_heartbeat TEXT,
+      created_at TEXT
+    )
+  `);
+  db.run(`
+    CREATE TABLE IF NOT EXISTS sessions (
+      id TEXT PRIMARY KEY,
+      from_user_id INTEGER NOT NULL,
+      to_user_id INTEGER NOT NULL,
+      from_username TEXT NOT NULL,
+      to_username TEXT NOT NULL,
+      domain TEXT NOT NULL,
+      session_data TEXT NOT NULL,
+      duration TEXT,
+      duration_label TEXT,
+      expires_at TEXT,
+      applied INTEGER DEFAULT 0,
+      revoked INTEGER DEFAULT 0,
+      original_sender_id INTEGER,
+      created_at TEXT
+    )
+  `);
+  db.run(`
+    CREATE TABLE IF NOT EXISTS history (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NOT NULL,
+      action TEXT NOT NULL,
+      domain TEXT,
+      detail TEXT,
+      created_at TEXT
+    )
+  `);
+  db.run(`
+    CREATE TABLE IF NOT EXISTS tokens (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NOT NULL,
+      token TEXT UNIQUE NOT NULL,
+      created_at TEXT
+    )
+  `);
+  db.run(`
+    CREATE TABLE IF NOT EXISTS about_info (
+      id INTEGER PRIMARY KEY DEFAULT 1,
+      data TEXT DEFAULT '{}'
+    )
+  `);
+  const aboutRow = db.exec("SELECT id FROM about_info WHERE id = 1");
+  if (!aboutRow.length || !aboutRow[0].values.length) {
+    db.run("INSERT INTO about_info (id, data) VALUES (1, '{}')");
+  }
+  saveDB();
+  console.log('Database initialized');
+}
+
+// ==================== SQL HELPERS ====================
+function dbGet(sql, params) {
+  const stmt = db.prepare(sql);
+  if (params) stmt.bind(params);
+  if (stmt.step()) {
+    const cols = stmt.getColumnNames();
+    const vals = stmt.get();
+    stmt.free();
+    const row = {};
+    cols.forEach((c, i) => row[c] = vals[i]);
+    return row;
+  }
+  stmt.free();
+  return null;
+}
+
+function dbAll(sql, params) {
+  const stmt = db.prepare(sql);
+  if (params) stmt.bind(params);
+  const rows = [];
+  while (stmt.step()) {
+    const cols = stmt.getColumnNames();
+    const vals = stmt.get();
+    const row = {};
+    cols.forEach((c, i) => row[c] = vals[i]);
+    rows.push(row);
+  }
+  stmt.free();
+  return rows;
+}
+
+function dbRun(sql, params) {
+  if (params) {
+    db.run(sql, params);
+  } else {
+    db.run(sql);
+  }
+}
+
+function getLastInsertId() {
+  const r = db.exec("SELECT last_insert_rowid() as id");
+  return r[0].values[0][0];
+}
 
 // ==================== HELPERS ====================
 function hashPass(p) { return crypto.createHash('sha256').update(p + 'elite_salt_v7').digest('hex'); }
 function genToken() { return crypto.randomBytes(32).toString('hex'); }
 function genId() { return crypto.randomBytes(16).toString('hex'); }
 function nowISO() { return new Date().toISOString(); }
-function getIP(req) { return req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.socket?.remoteAddress || 'unknown'; }
+function getIP(req) { return (req.headers['x-forwarded-for'] || '').split(',')[0].trim() || req.socket.remoteAddress || 'unknown'; }
 
 function getUserByToken(token) {
-  const row = db.prepare('SELECT u.* FROM users u JOIN tokens t ON u.id = t.user_id WHERE t.token = ?').get(token);
-  return row || null;
+  return dbGet("SELECT u.* FROM users u JOIN tokens t ON u.id = t.user_id WHERE t.token = ?", [token]);
 }
 
 function authMiddleware(req, res, next) {
@@ -100,7 +179,7 @@ function authMiddleware(req, res, next) {
 }
 
 function addHistory(userId, action, domain, detail) {
-  db.prepare('INSERT INTO history (user_id, action, domain, detail, created_at) VALUES (?, ?, ?, ?, ?)').run(userId, action, domain || null, detail || null, nowISO());
+  dbRun('INSERT INTO history (user_id, action, domain, detail, created_at) VALUES (?, ?, ?, ?, ?)', [userId, action, domain || null, detail || null, nowISO()]);
 }
 
 function calcExpiry(duration, customDate) {
@@ -118,7 +197,7 @@ function durationLabel(duration) {
 }
 
 // ==================== WebSocket ====================
-const wsClients = new Map(); // userId -> Set<ws>
+const wsClients = new Map();
 
 wss.on('connection', (ws) => {
   ws.isAlive = true;
@@ -134,22 +213,17 @@ wss.on('connection', (ws) => {
         ws.userRole = user.role;
         if (!wsClients.has(user.id)) wsClients.set(user.id, new Set());
         wsClients.get(user.id).add(ws);
-        // Update heartbeat
-        db.prepare('UPDATE users SET last_heartbeat = ? WHERE id = ?').run(nowISO(), user.id);
+        dbRun('UPDATE users SET last_heartbeat = ? WHERE id = ?', [nowISO(), user.id]);
         ws.send(JSON.stringify({ type: 'authenticated' }));
       }
       else if (msg.type === 'ping') {
         ws.isAlive = true;
-        if (ws.userId) db.prepare('UPDATE users SET last_heartbeat = ? WHERE id = ?').run(nowISO(), ws.userId);
+        if (ws.userId) dbRun('UPDATE users SET last_heartbeat = ? WHERE id = ?', [nowISO(), ws.userId]);
       }
       else if (msg.type === 'check-online') {
-        const target = db.prepare('SELECT id FROM users WHERE username = ?').get(msg.username);
-        if (target) {
-          const online = wsClients.has(target.id) && wsClients.get(target.id).size > 0;
-          ws.send(JSON.stringify({ type: 'online-status', username: msg.username, online }));
-        } else {
-          ws.send(JSON.stringify({ type: 'online-status', username: msg.username, online: false }));
-        }
+        const target = dbGet('SELECT id FROM users WHERE username = ?', [msg.username]);
+        const online = target && wsClients.has(target.id) && wsClients.get(target.id).size > 0;
+        ws.send(JSON.stringify({ type: 'online-status', username: msg.username, online: !!online }));
       }
     } catch (e) {}
   });
@@ -171,35 +245,20 @@ function wsSend(userId, msg) {
   return sent;
 }
 
-// ==================== EXPIRY CHECKER ====================
+// ==================== EXPIRY CHECKER (every 20s) ====================
 setInterval(() => {
   try {
-    const expired = db.prepare("SELECT * FROM sessions WHERE revoked = 0 AND expires_at IS NOT NULL AND expires_at < ?").all(nowISO());
+    if (!db) return;
+    const expired = dbAll("SELECT * FROM sessions WHERE revoked = 0 AND expires_at IS NOT NULL AND expires_at < ?", [nowISO()]);
     for (const s of expired) {
-      db.prepare('UPDATE sessions SET revoked = 1 WHERE id = ?').run(s.id);
+      dbRun('UPDATE sessions SET revoked = 1 WHERE id = ?', [s.id]);
       addHistory(s.to_user_id, 'expired', s.domain, 'Session expired');
       addHistory(s.from_user_id, 'expired', s.domain, 'Session to ' + s.to_username + ' expired');
-      // Send force-logout to receiver
       wsSend(s.to_user_id, { type: 'force-logout', sessionId: s.id, domain: s.domain, reason: 'Access expired.' });
     }
+    if (expired.length) saveDB();
   } catch (e) {}
-}, 20000); // Check every 20 seconds
-
-// ==================== HEARTBEAT CHECKER ====================
-// If receiver hasn't sent heartbeat in 5 minutes, consider disconnected
-setInterval(() => {
-  try {
-    const cutoff = new Date(Date.now() - 5 * 60 * 1000).toISOString();
-    const staleReceivers = db.prepare("SELECT id, username FROM users WHERE role = 'receiver' AND last_heartbeat IS NOT NULL AND last_heartbeat < ?").all(cutoff);
-    // Just clean up WS connections for stale users
-    for (const u of staleReceivers) {
-      if (wsClients.has(u.id)) {
-        wsClients.get(u.id).forEach(ws => { try { ws.terminate(); } catch(e) {} });
-        wsClients.delete(u.id);
-      }
-    }
-  } catch (e) {}
-}, 60000);
+}, 20000);
 
 // ==================== AUTH ROUTES ====================
 app.post('/api/register', (req, res) => {
@@ -209,27 +268,30 @@ app.post('/api/register', (req, res) => {
     if (username.length < 2 || username.length > 30) return res.status(400).json({ error: 'Username must be 2-30 characters' });
     if (!/^[a-zA-Z0-9_]+$/.test(username)) return res.status(400).json({ error: 'Username: letters, numbers, underscore only' });
 
-    const existing = db.prepare('SELECT id FROM users WHERE username = ?').get(username);
+    const existing = dbGet('SELECT id FROM users WHERE username = ?', [username]);
     if (existing) return res.status(400).json({ error: 'Username already taken' });
 
     const ip = getIP(req);
-    // IP lock for receivers
     if (role === 'receiver') {
-      const ipUser = db.prepare("SELECT username FROM users WHERE role = 'receiver' AND ip = ?").get(ip);
+      const ipUser = dbGet("SELECT username FROM users WHERE role = 'receiver' AND ip = ?", [ip]);
       if (ipUser) return res.status(400).json({ error: 'An account already exists from this device. Your existing username is: ' + ipUser.username });
     }
 
     const hash = hashPass(password);
     const ut = genToken();
     const sqHash = securityAnswer ? hashPass(securityAnswer.toLowerCase().trim()) : null;
+    const now = nowISO();
 
-    const result = db.prepare('INSERT INTO users (username, password_hash, role, ip, security_question, security_answer_hash, uninstall_token, last_heartbeat, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)').run(username, hash, role || 'receiver', ip, securityQuestion || null, sqHash, ut, nowISO(), nowISO());
+    dbRun('INSERT INTO users (username, password_hash, role, ip, security_question, security_answer_hash, uninstall_token, last_heartbeat, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      [username, hash, role || 'receiver', ip, securityQuestion || null, sqHash, ut, now, now]);
+    const userId = getLastInsertId();
 
     const token = genToken();
-    db.prepare('INSERT INTO tokens (user_id, token, created_at) VALUES (?, ?, ?)').run(result.lastInsertRowid, token, nowISO());
-    addHistory(result.lastInsertRowid, 'registered', null, 'Account created as ' + (role || 'receiver'));
+    dbRun('INSERT INTO tokens (user_id, token, created_at) VALUES (?, ?, ?)', [userId, token, now]);
+    addHistory(userId, 'registered', null, 'Account created as ' + (role || 'receiver'));
+    saveDB();
 
-    res.json({ id: result.lastInsertRowid, username, role: role || 'receiver', token, uninstallToken: ut });
+    res.json({ id: userId, username, role: role || 'receiver', token, uninstallToken: ut });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -238,13 +300,15 @@ app.post('/api/login', (req, res) => {
     const { username, password } = req.body;
     if (!username || !password) return res.status(400).json({ error: 'Username and password required' });
 
-    const user = db.prepare('SELECT * FROM users WHERE username = ?').get(username);
+    const user = dbGet('SELECT * FROM users WHERE username = ?', [username]);
     if (!user || user.password_hash !== hashPass(password)) return res.status(401).json({ error: 'Invalid username or password' });
 
     const token = genToken();
-    db.prepare('INSERT INTO tokens (user_id, token, created_at) VALUES (?, ?, ?)').run(user.id, token, nowISO());
-    db.prepare('UPDATE users SET last_heartbeat = ? WHERE id = ?').run(nowISO(), user.id);
+    const now = nowISO();
+    dbRun('INSERT INTO tokens (user_id, token, created_at) VALUES (?, ?, ?)', [user.id, token, now]);
+    dbRun('UPDATE users SET last_heartbeat = ? WHERE id = ?', [now, user.id]);
     addHistory(user.id, 'login', null, 'Logged in');
+    saveDB();
 
     res.json({ id: user.id, username: user.username, role: user.role, token, uninstallToken: user.uninstall_token });
   } catch (e) { res.status(500).json({ error: e.message }); }
@@ -253,45 +317,41 @@ app.post('/api/login', (req, res) => {
 app.post('/api/logout', authMiddleware, (req, res) => {
   try {
     const auth = req.headers.authorization.slice(7);
-    db.prepare('DELETE FROM tokens WHERE token = ?').run(auth);
+    dbRun('DELETE FROM tokens WHERE token = ?', [auth]);
+    saveDB();
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// ==================== UNINSTALL HANDLER ====================
+// ==================== UNINSTALL ====================
 app.get('/api/uninstall/:token', (req, res) => {
   try {
-    const user = db.prepare('SELECT * FROM users WHERE uninstall_token = ?').get(req.params.token);
+    const user = dbGet('SELECT * FROM users WHERE uninstall_token = ?', [req.params.token]);
     if (!user) return res.send('<html><body style="background:#0a0a0e;color:#f0ece4;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh"><div style="text-align:center"><h2 style="color:#D4AF37">Elite Access</h2><p>Session not found.</p></div></body></html>');
 
-    // Revoke ALL active sessions where this user is the receiver
-    const activeSessions = db.prepare('SELECT * FROM sessions WHERE to_user_id = ? AND revoked = 0').all(user.id);
-    for (const s of activeSessions) {
-      db.prepare('UPDATE sessions SET revoked = 1 WHERE id = ?').run(s.id);
-      addHistory(s.from_user_id, 'access_revoked', s.domain, 'Auto-revoked: ' + user.username + ' uninstalled extension');
-      // Notify the owner that the session was revoked
+    // Revoke all sessions TO this user
+    const inbound = dbAll('SELECT * FROM sessions WHERE to_user_id = ? AND revoked = 0', [user.id]);
+    for (const s of inbound) {
+      dbRun('UPDATE sessions SET revoked = 1 WHERE id = ?', [s.id]);
+      addHistory(s.from_user_id, 'access_revoked', s.domain, 'Auto-revoked: ' + user.username + ' uninstalled');
       wsSend(s.from_user_id, { type: 'session-revoked', sessionId: s.id });
-      // Try to force-logout the receiver (probably won't work since extension is gone, but try)
-      wsSend(user.id, { type: 'force-logout', sessionId: s.id, domain: s.domain, reason: 'Extension removed' });
     }
 
-    // Also revoke sessions this user SENT (if owner)
-    const sentSessions = db.prepare('SELECT * FROM sessions WHERE from_user_id = ? AND revoked = 0').all(user.id);
-    for (const s of sentSessions) {
-      db.prepare('UPDATE sessions SET revoked = 1 WHERE id = ?').run(s.id);
+    // Revoke all sessions FROM this user
+    const outbound = dbAll('SELECT * FROM sessions WHERE from_user_id = ? AND revoked = 0', [user.id]);
+    for (const s of outbound) {
+      dbRun('UPDATE sessions SET revoked = 1 WHERE id = ?', [s.id]);
       addHistory(s.to_user_id, 'access_revoked', s.domain, 'Owner uninstalled extension');
       wsSend(s.to_user_id, { type: 'force-logout', sessionId: s.id, domain: s.domain, reason: 'Access ended - owner removed extension.' });
     }
 
-    // Delete all tokens for this user
-    db.prepare('DELETE FROM tokens WHERE user_id = ?').run(user.id);
-    // Close WS connections
+    dbRun('DELETE FROM tokens WHERE user_id = ?', [user.id]);
     if (wsClients.has(user.id)) {
       wsClients.get(user.id).forEach(ws => { try { ws.terminate(); } catch(e) {} });
       wsClients.delete(user.id);
     }
-
     addHistory(user.id, 'uninstalled', null, 'Extension removed - all sessions revoked');
+    saveDB();
 
     res.send('<html><body style="background:#0a0a0e;color:#f0ece4;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh"><div style="text-align:center"><h2 style="color:#D4AF37">Elite Access</h2><p>All sessions have been logged out and revoked.</p><p style="color:#9a9690;font-size:13px;margin-top:10px">You can close this tab.</p></div></body></html>');
   } catch (e) { res.status(500).send('Error'); }
@@ -303,11 +363,10 @@ app.post('/api/send', authMiddleware, (req, res) => {
     const { toUsername, domain, sessionData, duration, customDate } = req.body;
     if (!toUsername || !domain || !sessionData) return res.status(400).json({ error: 'Missing fields' });
 
-    const toUser = db.prepare('SELECT * FROM users WHERE username = ?').get(toUsername);
+    const toUser = dbGet('SELECT * FROM users WHERE username = ?', [toUsername]);
     if (!toUser) return res.status(404).json({ error: 'User "' + toUsername + '" not found' });
     if (toUser.id === req.user.id) return res.status(400).json({ error: 'Cannot send to yourself' });
 
-    // Anti-reshare: only owners can send, OR check if receiver is trying to reshare
     if (req.user.role === 'receiver') {
       return res.status(403).json({ error: 'Reshare not allowed — only the original owner can share.' });
     }
@@ -317,12 +376,12 @@ app.post('/api/send', authMiddleware, (req, res) => {
     const label = durationLabel(duration);
     const ts = nowISO();
 
-    db.prepare('INSERT INTO sessions (id, from_user_id, to_user_id, from_username, to_username, domain, session_data, duration, duration_label, expires_at, original_sender_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(
-      sid, req.user.id, toUser.id, req.user.username, toUsername, domain, JSON.stringify(sessionData), duration, label, exp, req.user.id, ts
-    );
+    dbRun('INSERT INTO sessions (id, from_user_id, to_user_id, from_username, to_username, domain, session_data, duration, duration_label, expires_at, original_sender_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      [sid, req.user.id, toUser.id, req.user.username, toUsername, domain, JSON.stringify(sessionData), duration, label, exp, req.user.id, ts]);
 
     addHistory(req.user.id, 'sent', domain, 'Sent to ' + toUsername + ' (' + label + ')');
     addHistory(toUser.id, 'received', domain, 'From ' + req.user.username + ' (' + label + ')');
+    saveDB();
 
     const delivered = wsSend(toUser.id, {
       type: 'session-received', sessionId: sid, from: req.user.username, domain, durationLabel: label, expiresAt: exp, sessionData, timestamp: ts
@@ -334,90 +393,80 @@ app.post('/api/send', authMiddleware, (req, res) => {
 
 app.get('/api/session/:id', authMiddleware, (req, res) => {
   try {
-    const s = db.prepare('SELECT * FROM sessions WHERE id = ?').get(req.params.id);
+    const s = dbGet('SELECT * FROM sessions WHERE id = ?', [req.params.id]);
     if (!s) return res.status(404).json({ error: 'Session not found' });
     if (s.to_user_id !== req.user.id && s.from_user_id !== req.user.id) return res.status(403).json({ error: 'Access denied' });
     if (s.revoked) return res.status(403).json({ error: 'Session has been revoked' });
     if (s.expires_at && new Date(s.expires_at) < new Date()) {
-      db.prepare('UPDATE sessions SET revoked = 1 WHERE id = ?').run(s.id);
+      dbRun('UPDATE sessions SET revoked = 1 WHERE id = ?', [s.id]);
+      saveDB();
       return res.status(403).json({ error: 'Session has expired' });
     }
-
-    // Mark as applied
     if (s.to_user_id === req.user.id && !s.applied) {
-      db.prepare('UPDATE sessions SET applied = 1 WHERE id = ?').run(s.id);
+      dbRun('UPDATE sessions SET applied = 1 WHERE id = ?', [s.id]);
       addHistory(req.user.id, 'applied', s.domain, 'Applied session from ' + s.from_username);
+      saveDB();
     }
-
     res.json({ sessionData: JSON.parse(s.session_data), domain: s.domain });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.get('/api/inbox', authMiddleware, (req, res) => {
   try {
-    const sessions = db.prepare('SELECT id, from_username, to_username, domain, duration_label, expires_at, applied, revoked, created_at FROM sessions WHERE to_user_id = ? ORDER BY created_at DESC LIMIT 100').all(req.user.id);
+    const sessions = dbAll('SELECT id, from_username, to_username, domain, duration_label, expires_at, applied, revoked, created_at FROM sessions WHERE to_user_id = ? ORDER BY created_at DESC LIMIT 100', [req.user.id]);
     res.json({ sessions });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.get('/api/sent', authMiddleware, (req, res) => {
   try {
-    const sessions = db.prepare('SELECT id, from_username, to_username, domain, duration_label, expires_at, applied, revoked, created_at FROM sessions WHERE from_user_id = ? ORDER BY created_at DESC LIMIT 100').all(req.user.id);
+    const sessions = dbAll('SELECT id, from_username, to_username, domain, duration_label, expires_at, applied, revoked, created_at FROM sessions WHERE from_user_id = ? ORDER BY created_at DESC LIMIT 100', [req.user.id]);
     res.json({ sessions });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.post('/api/revoke/:id', authMiddleware, (req, res) => {
   try {
-    const s = db.prepare('SELECT * FROM sessions WHERE id = ? AND from_user_id = ?').get(req.params.id, req.user.id);
+    const s = dbGet('SELECT * FROM sessions WHERE id = ? AND from_user_id = ?', [req.params.id, req.user.id]);
     if (!s) return res.status(404).json({ error: 'Session not found' });
     if (s.revoked) return res.json({ ok: true, already: true });
-
-    db.prepare('UPDATE sessions SET revoked = 1 WHERE id = ?').run(s.id);
+    dbRun('UPDATE sessions SET revoked = 1 WHERE id = ?', [s.id]);
     addHistory(req.user.id, 'revoked', s.domain, 'Revoked access for ' + s.to_username);
     addHistory(s.to_user_id, 'access_revoked', s.domain, 'Access revoked by ' + req.user.username);
-
-    // Force-logout the receiver
+    saveDB();
     wsSend(s.to_user_id, { type: 'force-logout', sessionId: s.id, domain: s.domain, reason: 'Access revoked by owner.' });
-
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// ==================== TAMPER ENDPOINT ====================
+// ==================== TAMPER ====================
 app.post('/api/tamper', authMiddleware, (req, res) => {
   try {
     const { reason, extensionName } = req.body;
     addHistory(req.user.id, 'tamper_detected', null, (extensionName || reason || 'Unknown') + ' detected');
 
-    // Revoke ALL active sessions for this user (receiver)
-    const activeSessions = db.prepare('SELECT * FROM sessions WHERE to_user_id = ? AND revoked = 0').all(req.user.id);
+    const activeSessions = dbAll('SELECT * FROM sessions WHERE to_user_id = ? AND revoked = 0', [req.user.id]);
     const revokedDomains = [];
     for (const s of activeSessions) {
-      db.prepare('UPDATE sessions SET revoked = 1 WHERE id = ?').run(s.id);
+      dbRun('UPDATE sessions SET revoked = 1 WHERE id = ?', [s.id]);
       revokedDomains.push(s.domain);
-      addHistory(s.from_user_id, 'tamper_detected', s.domain, 'Tamper detected on ' + req.user.username + ': ' + (extensionName || reason));
+      addHistory(s.from_user_id, 'tamper_detected', s.domain, 'Tamper on ' + req.user.username + ': ' + (extensionName || reason));
       wsSend(s.from_user_id, { type: 'session-revoked', sessionId: s.id });
     }
 
-    // Delete tokens to force re-login
-    db.prepare('DELETE FROM tokens WHERE user_id = ?').run(req.user.id);
-
-    // Close WS connections
+    dbRun('DELETE FROM tokens WHERE user_id = ?', [req.user.id]);
     if (wsClients.has(req.user.id)) {
       wsClients.get(req.user.id).forEach(ws => { try { ws.terminate(); } catch(e) {} });
       wsClients.delete(req.user.id);
     }
-
+    saveDB();
     res.json({ ok: true, revokedDomains });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// ==================== TAMPER CHECK (called by receiver to get domains to clear) ====================
 app.post('/api/tamper-domains', authMiddleware, (req, res) => {
   try {
-    // Return all domains this receiver has active/recent sessions for
-    const sessions = db.prepare('SELECT DISTINCT domain FROM sessions WHERE to_user_id = ?').all(req.user.id);
+    const sessions = dbAll('SELECT DISTINCT domain FROM sessions WHERE to_user_id = ?', [req.user.id]);
     res.json({ domains: sessions.map(s => s.domain) });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -425,16 +474,16 @@ app.post('/api/tamper-domains', authMiddleware, (req, res) => {
 // ==================== HISTORY ====================
 app.get('/api/history', authMiddleware, (req, res) => {
   try {
-    const items = db.prepare('SELECT action, domain, detail, created_at FROM history WHERE user_id = ? ORDER BY created_at DESC LIMIT 200').all(req.user.id);
+    const items = dbAll('SELECT action, domain, detail, created_at FROM history WHERE user_id = ? ORDER BY created_at DESC LIMIT 200', [req.user.id]);
     res.json({ history: items });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// ==================== USER MANAGEMENT (Owner) ====================
+// ==================== USER MANAGEMENT ====================
 app.get('/api/receivers', authMiddleware, (req, res) => {
   try {
     if (req.user.role !== 'owner') return res.status(403).json({ error: 'Owners only' });
-    const receivers = db.prepare("SELECT id, username, ip, created_at FROM users WHERE role = 'receiver' ORDER BY created_at DESC").all();
+    const receivers = dbAll("SELECT id, username, ip, created_at FROM users WHERE role = 'receiver' ORDER BY created_at DESC");
     res.json({ receivers });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -444,27 +493,23 @@ app.post('/api/reset-password', authMiddleware, (req, res) => {
     if (req.user.role !== 'owner') return res.status(403).json({ error: 'Owners only' });
     const { username, newPassword } = req.body;
     if (!username || !newPassword) return res.status(400).json({ error: 'Username and new password required' });
-
-    const target = db.prepare("SELECT * FROM users WHERE username = ? AND role = 'receiver'").get(username);
+    const target = dbGet("SELECT * FROM users WHERE username = ? AND role = 'receiver'", [username]);
     if (!target) return res.status(404).json({ error: 'Receiver "' + username + '" not found' });
-
-    db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(hashPass(newPassword), target.id);
-    db.prepare('DELETE FROM tokens WHERE user_id = ?').run(target.id);
+    dbRun('UPDATE users SET password_hash = ? WHERE id = ?', [hashPass(newPassword), target.id]);
+    dbRun('DELETE FROM tokens WHERE user_id = ?', [target.id]);
     addHistory(target.id, 'password_reset', null, 'Password reset by owner');
-
-    // Close WS connections to force re-login
+    saveDB();
     if (wsClients.has(target.id)) {
       wsClients.get(target.id).forEach(ws => { try { ws.terminate(); } catch(e) {} });
       wsClients.delete(target.id);
     }
-
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.get('/api/user/:username', authMiddleware, (req, res) => {
   try {
-    const target = db.prepare('SELECT id FROM users WHERE username = ?').get(req.params.username);
+    const target = dbGet('SELECT id FROM users WHERE username = ?', [req.params.username]);
     if (!target) return res.json({ online: false, exists: false });
     const online = wsClients.has(target.id) && wsClients.get(target.id).size > 0;
     res.json({ online, exists: true });
@@ -476,7 +521,7 @@ app.post('/api/recover/question', (req, res) => {
   try {
     const { username } = req.body;
     if (!username) return res.status(400).json({ error: 'Username required' });
-    const user = db.prepare('SELECT security_question FROM users WHERE username = ?').get(username);
+    const user = dbGet('SELECT security_question FROM users WHERE username = ?', [username]);
     if (!user) return res.status(404).json({ error: 'User not found' });
     if (!user.security_question) return res.status(400).json({ error: 'No security question set. Contact the account owner to reset your password.' });
     res.json({ question: user.security_question });
@@ -487,25 +532,22 @@ app.post('/api/recover/verify', (req, res) => {
   try {
     const { username, answer, newPassword } = req.body;
     if (!username || !answer || !newPassword) return res.status(400).json({ error: 'All fields required' });
-
-    const user = db.prepare('SELECT * FROM users WHERE username = ?').get(username);
+    const user = dbGet('SELECT * FROM users WHERE username = ?', [username]);
     if (!user) return res.status(404).json({ error: 'User not found' });
-
     const answerHash = hashPass(answer.toLowerCase().trim());
     if (answerHash !== user.security_answer_hash) {
       addHistory(user.id, 'recovery_failed', null, 'Wrong security answer');
+      saveDB();
       return res.status(401).json({ error: 'Wrong answer. Try again or contact the account owner.' });
     }
-
-    db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(hashPass(newPassword), user.id);
-    db.prepare('DELETE FROM tokens WHERE user_id = ?').run(user.id);
+    dbRun('UPDATE users SET password_hash = ? WHERE id = ?', [hashPass(newPassword), user.id]);
+    dbRun('DELETE FROM tokens WHERE user_id = ?', [user.id]);
     addHistory(user.id, 'password_recovered', null, 'Password recovered via security question');
-
+    saveDB();
     if (wsClients.has(user.id)) {
       wsClients.get(user.id).forEach(ws => { try { ws.terminate(); } catch(e) {} });
       wsClients.delete(user.id);
     }
-
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -513,7 +555,7 @@ app.post('/api/recover/verify', (req, res) => {
 // ==================== ABOUT ====================
 app.get('/api/about', (req, res) => {
   try {
-    const row = db.prepare('SELECT data FROM about_info WHERE id = 1').get();
+    const row = dbGet('SELECT data FROM about_info WHERE id = 1');
     res.json({ about: row ? JSON.parse(row.data) : {} });
   } catch (e) { res.json({ about: {} }); }
 });
@@ -521,15 +563,25 @@ app.get('/api/about', (req, res) => {
 app.post('/api/about', authMiddleware, (req, res) => {
   try {
     if (req.user.role !== 'owner') return res.status(403).json({ error: 'Owners only' });
-    db.prepare('UPDATE about_info SET data = ? WHERE id = 1').run(JSON.stringify(req.body.about || {}));
+    dbRun('UPDATE about_info SET data = ? WHERE id = 1', [JSON.stringify(req.body.about || {})]);
+    saveDB();
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// ==================== HEALTH CHECK ====================
+// ==================== HEALTH ====================
 app.get('/', (req, res) => res.json({ status: 'Elite Access Server v7', time: nowISO() }));
 app.get('/health', (req, res) => res.json({ ok: true }));
 
 // ==================== START ====================
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log('Elite Access Server v7 running on port ' + PORT));
+initDB().then(() => {
+  server.listen(PORT, () => console.log('Elite Access Server v7 running on port ' + PORT));
+}).catch(e => {
+  console.error('Failed to start:', e);
+  process.exit(1);
+});
+
+// Save on exit
+process.on('SIGTERM', () => { saveDB(); process.exit(0); });
+process.on('SIGINT', () => { saveDB(); process.exit(0); });
