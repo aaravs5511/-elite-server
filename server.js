@@ -61,6 +61,14 @@ db.exec(`
   );
 `);
 
+// Settings table for About info (owner-controlled, receivers fetch live)
+db.exec(`
+  CREATE TABLE IF NOT EXISTS settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+  );
+`);
+
 try { db.exec('ALTER TABLE users ADD COLUMN security_question TEXT'); } catch(e) {}
 try { db.exec('ALTER TABLE users ADD COLUMN security_answer_hash TEXT'); } catch(e) {}
 try { db.exec('ALTER TABLE users ADD COLUMN uninstall_token TEXT'); } catch(e) {}
@@ -95,6 +103,9 @@ const q = {
 
   addHistory: db.prepare('INSERT INTO history (user_id, action, domain, detail, created_at) VALUES (?, ?, ?, ?, ?)'),
   getHistory: db.prepare('SELECT action, domain, detail, created_at FROM history WHERE user_id = ? ORDER BY created_at DESC LIMIT 100'),
+
+  getSetting: db.prepare('SELECT value FROM settings WHERE key = ?'),
+  setSetting: db.prepare('INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = ?'),
 };
 
 // ==================== EXPIRY CHECKER (every 20s) ====================
@@ -338,6 +349,24 @@ app.post('/api/tamper', auth, (req, res) => {
   active.forEach(s => sendWS(req.user.id, { type: 'force-logout', sessionId: s.id, domain: s.domain, reason: 'Security violation' }));
   q.deleteUserTokens.run(req.user.id);
   res.json({ ok: true });
+});
+
+// ==================== SETTINGS (About info — owner sets, everyone reads) ====================
+// Anyone can read (even without auth — so receiver extension can fetch on load)
+app.get('/api/about', (req, res) => {
+  const row = q.getSetting.get('about');
+  if (!row) return res.json({ about: { developer: '', description: '', website: '', instagram: '', facebook: '', twitter: '', telegram: '', email: '' } });
+  try { res.json({ about: JSON.parse(row.value) }); } catch(e) { res.json({ about: {} }); }
+});
+
+// Only owner can update
+app.post('/api/about', auth, (req, res) => {
+  if (req.user.role !== 'owner') return res.status(403).json({ error: 'Owner only' });
+  const { about } = req.body;
+  if (!about) return res.status(400).json({ error: 'About data required' });
+  const json = JSON.stringify(about);
+  q.setSetting.run('about', json, json);
+  res.json({ success: true, message: 'About info updated for all users' });
 });
 
 app.post('/api/logout', auth, (req, res) => {
